@@ -58,6 +58,16 @@ Skills 复用既有 SSOT、下载、链接/复制和备份机制，新增独立�
 
 ## 会话和 Token 语义
 
+T3 Code 的托管数据可通过 `scripts/t3_usage_bridge.py` 自动采集：默认扫描 `~/.t3/userdata/providers/antigravity/*/antigravity-acp/brain`，从同 profile 的 `conversations/<id>.db` 只读补齐模型、首字延迟及总耗时，再由 CC Switch 现有扫描器导入。每轮采集重新发现 profile，沿用会话 ID＋步骤 ID 去重；登录、配置及 T3 原生文件均不修改。自定义 T3 数据目录可用脚本的 `--source` 指定。
+
+在「用量统计」中同步会话用量，按 Antigravity（会话）查看请求；计时齐全时可显示首字、耗时和输出 token/s。输出计数包含思考 token，速度是该计数口径下的吞吐，不等于可见正文速度；首字延迟也不等于网络 RTT。
+
+### 官方版本升级后的连续统计
+
+运行 `python3 scripts/t3_usage_bridge.py` 生成兼容的统计目录 `~/.cc-switch/agy/t3-usage/antigravity-cli`。脚本只从 T3 读取已完成响应的 token、模型、时间及白名单原生计时字段，写入独立的统计镜像，不复制聊天正文、工具结果、账号或认证，也不直接写 CC Switch 统计库。未变化的统计不重写；原有会话 ID 和步骤 ID 保留，兼容扫描器现有去重逻辑。该目录仅供统计，虽然原有会话扫描器可能将它列入会话列表，但它没有完整聊天状态，不能用来恢复聊天。T3 会话应在 T3 中继续。
+
+macOS 可由用户级 LaunchAgent 每 30 秒执行脚本；CC Switch 启用「自动同步会话用量」后，启动、用量页自动刷新及每 10 分钟后台同步均使用现有导入器。脚本和 LaunchAgent 位于应用包之外，CC Switch 官方升级不会覆盖它们。更换 T3 的默认数据根目录或上游变更存储格式后，需调整路径或解析器，不能保证跨不兼容格式永久有效。
+
 会话同时扫描 CLI 的 `~/.gemini/antigravity-cli/brain` 与 Antigravity IDE 的 `~/.gemini/antigravity/brain`（布局相同，各自带同级 `conversation_summaries.db`）；缺失的目录会被忽略，同一会话 ID 只计一次。
 
 会话列表以只读方式打开 SQLite，读取 `conversation_summaries` 的标题、预览、工作目录和时间。列表优先使用索引，避免每次刷新都解析所有正文；没有索引时回退解析 JSONL。只有二进制记录、没有可读日志的会话仍可展示摘要和恢复命令，不伪造正文。
