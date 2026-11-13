@@ -29,6 +29,26 @@ pub(crate) fn resume_after_rollback<T>(
     }
 }
 
+/// Settle an operation that ran under `catch_unwind` and must be undone if it
+/// did not finish. `rollback` runs at most once: on a panic it runs before the
+/// original panic resumes (see [`resume_after_rollback`]); on an error it runs
+/// and the original error is returned unchanged, or merged with the rollback
+/// failure by `combine` so neither error is lost.
+pub(crate) fn finish_with_rollback<T>(
+    outcome: std::thread::Result<Result<T, crate::error::AppError>>,
+    rollback: impl FnOnce() -> Result<(), crate::error::AppError>,
+    combine: impl FnOnce(crate::error::AppError, crate::error::AppError) -> crate::error::AppError,
+) -> Result<T, crate::error::AppError> {
+    match outcome {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => match rollback() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(combine(error, rollback_error)),
+        },
+        Err(payload) => resume_after_rollback(Err(payload), rollback),
+    }
+}
+
 /// Serialize file operations without making one panicking caller disable the
 /// file for the rest of the process. These locks contain no in-memory state;
 /// callers must still reload/validate files and use their normal atomic writes
@@ -60,10 +80,13 @@ pub(crate) fn in_isolated_process(test_name: &str) -> bool {
         .env("CC_SWITCH_TEST_HOME", home.path())
         .output()
         .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // libtest exits 0 when `--exact` matches nothing, so also require that the
+    // named test actually ran; a renamed or moved test must not pass silently.
     assert!(
-        output.status.success(),
-        "isolated poison test failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "isolated poison test failed or did not run:\n{}\n{}",
+        stdout,
         String::from_utf8_lossy(&output.stderr)
     );
     false
@@ -98,6 +121,58 @@ mod tests {
                 Some(&"original")
             );
         }
+    }
+
+    #[test]
+    fn finish_with_rollback_runs_rollback_once_and_keeps_both_errors() {
+        use crate::error::AppError;
+        let runs = std::cell::Cell::new(0);
+        let ok = finish_with_rollback(
+            Ok(Ok(1)),
+            || {
+                runs.set(runs.get() + 1);
+                Ok(())
+            },
+            |error, _| error,
+        );
+        assert_eq!(ok.unwrap(), 1);
+        assert_eq!(runs.get(), 0);
+
+        let original = finish_with_rollback::<()>(
+            Ok(Err(AppError::Message("commit".into()))),
+            || {
+                runs.set(runs.get() + 1);
+                Ok(())
+            },
+            |_, _| unreachable!(),
+        );
+        assert_eq!(original.unwrap_err().to_string(), "commit");
+        assert_eq!(runs.get(), 1);
+
+        let combined = finish_with_rollback::<()>(
+            Ok(Err(AppError::Message("commit".into()))),
+            || Err(AppError::Message("restore".into())),
+            |error, rollback| AppError::Message(format!("{error}; {rollback}")),
+        );
+        assert_eq!(combined.unwrap_err().to_string(), "commit; restore");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outcome =
+                std::panic::catch_unwind(|| -> Result<(), AppError> { panic!("interrupted") });
+            let _ = finish_with_rollback(
+                outcome,
+                || {
+                    runs.set(runs.get() + 1);
+                    Ok(())
+                },
+                |error, _| error,
+            );
+        }));
+        assert_eq!(
+            panicked.unwrap_err().downcast_ref::<&str>(),
+            Some(&"interrupted")
+        );
+        assert_eq!(runs.get(), 2);
     }
 
     #[test]

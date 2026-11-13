@@ -20,6 +20,14 @@ use std::{
 };
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// The options file this thread last wrote and its exact bytes. Rollback
+    /// compares against them so it never replaces a later edit by Copilot or
+    /// the user with the snapshot taken before the operation.
+    static WRITTEN_OPTIONS: std::cell::RefCell<Option<(PathBuf, Vec<u8>)>> =
+        const { std::cell::RefCell::new(None) };
+}
 const TRANSPORT_FIELDS: [&str; 7] = ["command", "args", "env", "url", "headers", "type", "cwd"];
 /// 条目里只有 Copilot 认、停用时要记下来的字段。
 const NATIVE_OPTION_FIELDS: [&str; 2] = ["tools", "timeout"];
@@ -66,12 +74,12 @@ fn write_options(path: &Path, options: Map<String, Value>) -> Result<(), AppErro
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
-    atomic_write(
-        path,
-        serde_json::to_string_pretty(&Value::Object(options))
-            .map_err(|e| AppError::Config(e.to_string()))?
-            .as_bytes(),
-    )
+    let bytes = serde_json::to_string_pretty(&Value::Object(options))
+        .map_err(|e| AppError::Config(e.to_string()))?
+        .into_bytes();
+    atomic_write(path, &bytes)?;
+    WRITTEN_OPTIONS.with(|written| *written.borrow_mut() = Some((path.to_path_buf(), bytes)));
+    Ok(())
 }
 
 /// `run` 失败时把 `path` 恢复成调用前的样子（`mcp-config.json` 由 `write_and_commit` 回滚，
@@ -85,23 +93,41 @@ fn with_file_rollback<T>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(AppError::io(path, error)),
     };
-    let rollback = || match previous.as_deref() {
-        Some(bytes) => atomic_write(path, bytes),
-        None => match fs::remove_file(path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                Err(AppError::io(path, error))
-            }
-            _ => Ok(()),
-        },
+    WRITTEN_OPTIONS.with(|written| written.borrow_mut().take());
+    let rollback = || {
+        let written = WRITTEN_OPTIONS
+            .with(|written| written.borrow_mut().take())
+            .filter(|(written_path, _)| written_path == path);
+        // Nothing written by this operation: nothing of ours to undo.
+        let Some((_, expected)) = written else {
+            return Ok(());
+        };
+        let current = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AppError::io(path, error)),
+        };
+        if current.as_deref() != Some(expected.as_slice()) {
+            return Err(AppError::Conflict(format!(
+                "{} changed after CC Switch wrote it; refusing to roll back",
+                path.display()
+            )));
+        }
+        match previous.as_deref() {
+            Some(bytes) => atomic_write(path, bytes),
+            None => match fs::remove_file(path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(AppError::io(path, error))
+                }
+                _ => Ok(()),
+            },
+        }
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
-    let result = crate::sync_utils::resume_after_rollback(outcome, rollback);
-    if result.is_err() {
-        if let Err(error) = rollback() {
-            log::error!("恢复 {} 失败: {error}", path.display());
-        }
-    }
-    result
+    crate::sync_utils::finish_with_rollback(outcome, rollback, |error, rollback_error| {
+        log::error!("恢复 {} 失败: {rollback_error}", path.display());
+        error
+    })
 }
 
 fn read(path: &Path) -> Result<Value, AppError> {
@@ -521,6 +547,30 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
             assert_eq!(fs::read(&options).ok().as_deref(), saved_options);
         }
+    }
+
+    #[test]
+    fn rollback_keeps_external_option_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = dir.path().join("options.json");
+        fs::write(&options, b"{}").unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            let _: Result<(), AppError> = with_file_rollback(&options, || {
+                write_options(&options, Map::new())?;
+                fs::write(&options, b"{\"external\":{}}").unwrap();
+                panic!("commit interrupted");
+            });
+        })
+        .is_err());
+        assert_eq!(fs::read(&options).unwrap(), b"{\"external\":{}}");
+
+        // An operation that never wrote the file does not touch it either.
+        let result: Result<(), AppError> = with_file_rollback(&options, || {
+            fs::write(&options, b"{\"later\":{}}").unwrap();
+            Err(AppError::Message("commit failed".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&options).unwrap(), b"{\"later\":{}}");
     }
 
     #[test]

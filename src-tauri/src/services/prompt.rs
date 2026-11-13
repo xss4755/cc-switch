@@ -556,15 +556,11 @@ fn persist_pi_prompt_with_native_update(
         None => state.db.delete_prompt(AppType::Pi.as_str(), id),
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(update_native));
-    if let Err(native_error) = crate::sync_utils::resume_after_rollback(outcome, rollback) {
-        if let Err(rollback_error) = rollback() {
-            return Err(AppError::Message(format!(
-                "Pi prompt update failed ({native_error}); database rollback also failed: {rollback_error}"
-            )));
-        }
-        return Err(native_error);
-    }
-    Ok(())
+    crate::sync_utils::finish_with_rollback(outcome, rollback, |native_error, rollback_error| {
+        AppError::Message(format!(
+            "Pi prompt update failed ({native_error}); database rollback also failed: {rollback_error}"
+        ))
+    })
 }
 
 fn enable_pi_prompt(state: &AppState, id: &str) -> Result<(), AppError> {

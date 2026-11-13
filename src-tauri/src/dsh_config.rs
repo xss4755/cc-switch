@@ -427,7 +427,7 @@ fn edit_files_and_commit<T>(
             })
             .and_then(|()| commit())
     }));
-    let mut rollback = || {
+    let rollback = || {
         let failures: Vec<_> = written
             .iter()
             .rev()
@@ -446,17 +446,9 @@ fn edit_files_and_commit<T>(
             )))
         }
     };
-    let result = crate::sync_utils::resume_after_rollback(outcome, &mut rollback);
-    match result {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            if let Err(rollback_error) = rollback() {
-                Err(AppError::Message(format!("{error}; {rollback_error}")))
-            } else {
-                Err(error)
-            }
-        }
-    }
+    crate::sync_utils::finish_with_rollback(outcome, rollback, |error, rollback_error| {
+        AppError::Message(format!("{error}; {rollback_error}"))
+    })
 }
 
 /// A profile that no longer parses fails the whole write, but the plan only reports the YAML

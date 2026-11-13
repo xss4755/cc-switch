@@ -252,13 +252,11 @@ pub(crate) fn write_and_commit<T>(
         }
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(commit));
-    match crate::sync_utils::resume_after_rollback(outcome, rollback) {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            rollback()?;
-            Err(error)
-        }
-    }
+    crate::sync_utils::finish_with_rollback(outcome, rollback, |error, rollback_error| {
+        // The frontend shows the first `omp.errors.*` key; keep the rollback
+        // key first (its text covers the failed save) without losing `error`.
+        AppError::Message(format!("{rollback_error}; {error}"))
+    })
 }
 
 fn read_text(path: &Path) -> Result<(Option<Vec<u8>>, String), AppError> {

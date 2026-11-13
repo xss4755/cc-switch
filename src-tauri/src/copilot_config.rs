@@ -1137,18 +1137,12 @@ fn transact<T>(
         }
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(commit));
-    match crate::sync_utils::resume_after_rollback(outcome, rollback) {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            if let Err(rollback_error) = rollback() {
-                return Err(AppError::Message(format!(
-                    "Config update failed ({error}); restoring {} also failed: {rollback_error}",
-                    path.display()
-                )));
-            }
-            Err(error)
-        }
-    }
+    crate::sync_utils::finish_with_rollback(outcome, rollback, |error, rollback_error| {
+        AppError::Message(format!(
+            "Config update failed ({error}); restoring {} also failed: {rollback_error}",
+            path.display()
+        ))
+    })
 }
 
 /// 测试用：不经全局锁和路径解析，直接对 `path` 做一次 [`save_and_commit`] 的写入。

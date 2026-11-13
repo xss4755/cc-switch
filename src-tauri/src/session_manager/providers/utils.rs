@@ -146,9 +146,14 @@ impl FileParseCache {
             );
         }
 
-        if let Ok(mut guard) = self.entries.lock() {
-            *guard = next;
-        }
+        // A scan that panicked meanwhile left nothing worth keeping; replace it
+        // and clear the poison instead of discarding this scan's results.
+        let mut guard = self.entries.lock().unwrap_or_else(|poisoned| {
+            let guard = poisoned.into_inner();
+            self.entries.clear_poison();
+            guard
+        });
+        *guard = next;
         sessions
     }
 }

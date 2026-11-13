@@ -416,10 +416,8 @@ impl OmoService {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::opencode_config::add_plugin(v.plugin_name)
         }));
-        if let Err(err) = crate::sync_utils::resume_after_rollback(outcome, rollback) {
-            rollback()?;
-            return Err(err);
-        }
+        // Rollback failures are logged inside `rollback`, which always returns Ok.
+        crate::sync_utils::finish_with_rollback(outcome, rollback, |error, _| error)?;
         if expected_contents.is_some() {
             log::info!("{} config written to {config_path:?}", v.label);
         }
@@ -488,10 +486,8 @@ impl OmoService {
             }
             Ok(())
         };
-        if let Err(err) = crate::sync_utils::resume_after_rollback(outcome, rollback) {
-            rollback()?;
-            return Err(err);
-        }
+        // Rollback failures are logged inside `rollback`, which always returns Ok.
+        crate::sync_utils::finish_with_rollback(outcome, rollback, |error, _| error)?;
 
         let changed_paths: Vec<_> = applied_changes
             .iter()

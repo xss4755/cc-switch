@@ -42,34 +42,66 @@ pub(crate) fn write_and_commit<T>(
             Err(error) => Err(AppError::io(path, error)),
         }
     }
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .ok()
+            .map(|meta| meta.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    fn file_mode(_path: &Path) -> Option<u32> {
+        None
+    }
     let target = crate::config::resolve_symlink_target(path);
     let previous = snapshot(path)?;
+    // Restore the file with the permissions it had, not the writer's: callers
+    // such as the pricing file use world-readable writes.
+    let previous_mode = previous.as_ref().and_then(|_| file_mode(path));
+    let mut write_failed = false;
     let mut written = None;
     // The write callback can itself publish one file before a later step panics.
     // Keep the existing error behavior, but protect both callbacks on unwind.
-    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<_, AppError> {
-        write()?;
-        written = match snapshot(path) {
-            Ok(snapshot) => Some(snapshot),
-            // The write already succeeded. A failed revision read must also
-            // restore the file instead of skipping the database commit alone.
-            Err(error) => return Ok(Err(error)),
-        };
-        Ok(commit())
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = write() {
+            write_failed = true;
+            return Err(error);
+        }
+        // The write already succeeded. A failed revision read must also
+        // restore the file instead of skipping the database commit alone.
+        written = Some(snapshot(path)?);
+        commit()
     }));
     let rollback = || {
-        // Once write returned, do not overwrite a later external edit made
-        // during commit. A panicking write has no returned revision to compare.
-        if let Some(expected) = &written {
-            if snapshot(path)? != *expected {
-                return Err(AppError::Conflict(format!(
-                    "Config changed after CC Switch wrote it; refusing to roll back {}",
-                    path.display()
-                )));
+        // A write that reported an error has not replaced the file.
+        if write_failed {
+            return Ok(());
+        }
+        let current = snapshot(path);
+        match &written {
+            // Once write returned, do not overwrite a later external edit
+            // made during commit.
+            Some(expected) => {
+                if current? != *expected {
+                    return Err(AppError::Conflict(format!(
+                        "Config changed after CC Switch wrote it; refusing to roll back {}",
+                        path.display()
+                    )));
+                }
+            }
+            // A write that panicked returned no revision to compare. Leave an
+            // untouched file alone; otherwise assume the write published it.
+            None => {
+                if current.is_ok_and(|current| current == previous) {
+                    return Ok(());
+                }
             }
         }
         match previous.as_deref() {
-            Some(bytes) => atomic_write_private(path, bytes),
+            Some(bytes) => {
+                crate::config::stage_write(path, bytes, previous_mode.or(Some(0o600)), false)?
+                    .commit()
+            }
             None => match fs::remove_file(&target) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                     Err(AppError::io(&target, error))
@@ -78,20 +110,12 @@ pub(crate) fn write_and_commit<T>(
             },
         }
     };
-    // The inner result separates write validation errors from commit errors.
-    let result = crate::sync_utils::resume_after_rollback(outcome, rollback)?;
-    match result {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            if let Err(rollback_error) = rollback() {
-                return Err(AppError::Message(format!(
-                    "Config update failed ({error}); restoring {} also failed: {rollback_error}",
-                    path.display()
-                )));
-            }
-            Err(error)
-        }
-    }
+    crate::sync_utils::finish_with_rollback(outcome, rollback, |error, rollback_error| {
+        AppError::Message(format!(
+            "Config update failed ({error}); restoring {} also failed: {rollback_error}",
+            path.display()
+        ))
+    })
 }
 
 pub(crate) fn config_path() -> PathBuf {
@@ -445,6 +469,36 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(!target.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rollback_keeps_original_permissions_and_untouched_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        fs::write(&path, "original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // A failed commit restores the contents and the file's own mode, not 0600.
+        let result: Result<(), AppError> = write_and_commit(
+            &path,
+            || atomic_write_private(&path, b"ours"),
+            || Err(AppError::Database("locked".into())),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(mode(&path), 0o644);
+
+        // A write that panics before touching the file leaves it alone.
+        assert!(std::panic::catch_unwind(|| {
+            let _: Result<(), AppError> =
+                write_and_commit(&path, || panic!("write interrupted"), || Ok(()));
+        })
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(mode(&path), 0o644);
     }
 
     #[test]

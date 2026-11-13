@@ -215,14 +215,15 @@ impl PiPromptTemplateService {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 atomic_write(&path, content.as_bytes())
             }));
-            if let Err(write_error) = crate::sync_utils::resume_after_rollback(outcome, rollback) {
-                if let Err(rollback_error) = rollback() {
-                    return Err(AppError::Message(format!(
-                        "Pi prompt template save failed ({write_error}); rename rollback also failed: {rollback_error}"
-                    )));
-                }
-                return Err(write_error);
-            }
+            crate::sync_utils::finish_with_rollback(
+                outcome,
+                rollback,
+                |write_error, rollback_error| {
+                    AppError::Message(format!(
+                    "Pi prompt template save failed ({write_error}); rename rollback also failed: {rollback_error}"
+                ))
+                },
+            )?;
         } else {
             ensure_revision(&path, expected_revision, "Pi prompt template")?;
             atomic_write(&path, content.as_bytes())?;
